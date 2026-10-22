@@ -1,0 +1,1 @@
+{"name": "ru-voice-agent", "description": "Self-hosted Russian voice agent: T-one STT, Silero VAD, any LLM, Piper/Kokoro/Fish TTS, WebSocket and browser UI.", "homepage": "", "topics": ["voice-agent", "russian", "speech-to-text", "text-to-speech", "voice-assistant", "llm", "ollama", "websocket", "onnx", "self-hosted"]}

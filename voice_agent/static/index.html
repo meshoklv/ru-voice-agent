@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Voice agent</title>
+<style>
+  :root{color-scheme:light dark;--bg:#f6f7f9;--card:#fff;--line:#e3e6ea;--text:#14171c;--dim:#667085;
+        --accent:#4f46e5;--ok:#16a34a;--warn:#b45309;--bad:#dc2626}
+  @media (prefers-color-scheme:dark){:root{--bg:#0e1116;--card:#171b22;--line:#262c36;--text:#e8ebf0;--dim:#8b95a5;--accent:#818cf8}}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+  .wrap{max-width:720px;margin:0 auto;padding:20px 16px 40px}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:var(--dim);margin:0 0 16px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:14px}
+  .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  button{font:inherit;cursor:pointer;border-radius:12px;border:1px solid var(--line);background:var(--card);color:var(--text);padding:10px 16px}
+  #talk{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600;min-width:170px}
+  #talk.live{background:var(--bad);border-color:var(--bad)}
+  .state{display:inline-block;padding:3px 10px;border-radius:99px;background:var(--line);font-size:13px}
+  .state.listen{background:#dcfce7;color:#166534}.state.think{background:#fef3c7;color:#92400e}.state.talk{background:#e0e7ff;color:#3730a3}
+  #lvl{height:6px;border-radius:3px;background:var(--ok);width:0;transition:width .08s}
+  #log{min-height:160px;max-height:46vh;overflow:auto;display:flex;flex-direction:column;gap:8px}
+  .msg{max-width:88%;padding:8px 12px;border-radius:12px;background:var(--bg);border:1px solid var(--line)}
+  .msg.you{align-self:flex-end}.msg.bot{align-self:flex-start;border-color:var(--accent)}
+  .msg small{display:block;color:var(--dim);font-size:12px}
+  .note{align-self:center;color:var(--dim);font-size:12px}
+  .empty{color:var(--dim);text-align:center;margin:auto}
+  .metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px}
+  .metrics div{background:var(--bg);border-radius:10px;padding:8px 10px;font-size:13px;color:var(--dim)}
+  .metrics b{display:block;color:var(--text);font-size:16px}
+  #err{color:var(--bad);white-space:pre-wrap;min-height:1em}
+  select,label{font:inherit;color:var(--text)}
+  select{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Voice agent</h1>
+  <p class="sub">Press <b>Call</b>, allow the microphone and talk Russian. The agent says hello first.</p>
+
+  <div class="card">
+    <div class="row">
+      <button id="talk">Call</button>
+      <span id="state" class="state">connecting…</span>
+      <select id="voice" title="Voice" hidden></select>
+    </div>
+    <div style="margin-top:12px;height:6px;background:var(--line);border-radius:3px"><div id="lvl"></div></div>
+    <div id="err"></div>
+  </div>
+
+  <div class="card"><div id="log"><div class="empty">The conversation will appear here</div></div></div>
+
+  <div class="card metrics">
+    <div>pause after you stop<b id="t_pause">–</b></div>
+    <div>recognition<b id="t_stt">–</b></div>
+    <div>first LLM word<b id="t_llm1">–</b></div>
+    <div>last sentence synthesis<b id="t_tts">–</b></div>
+  </div>
+  <div class="card row">
+    <label><input type="checkbox" id="barge" checked> let me interrupt the agent</label>
+    <label>silence that ends my turn <input type="range" id="sil" min="400" max="1500" step="50" value="700"> <span id="silv">0.7 s</span></label>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const ms = v => v == null ? '–' : (v >= 1000 ? (v/1000).toFixed(2) + ' s' : Math.round(v) + ' ms');
+const showErr = t => $('err').textContent = t || '';
+const setState = (t, k) => { $('state').textContent = t; $('state').className = 'state ' + (k || ''); };
+
+const SILENCE_LEVEL = 0.018, MIN_SPEECH_MS = 350, ECHO_TAIL_MS = 350;
+const BARGE_LEVEL = 0.05, BARGE_FRAMES = 3, BARGE_GUARD_MS = 400;
+let SILENCE_MS = 700;
+
+// The token comes from the page URL (?k=...) or the cookie set by the server.
+const K = new URLSearchParams(location.search).get('k');
+const withK = p => K ? p + (p.includes('?') ? '&' : '?') + 'k=' + encodeURIComponent(K) : p;
+const BASE = location.pathname.replace(/\/$/, '');
+
+let ws, ctx, node, stream, player;
+let micLive = false, sending = false, busy = false, inCall = false, waitingGreeting = false;
+let speechMs = 0, silenceSince = 0, spokeAt = 0, bargeFrames = 0, endSentAt = 0, firstHeard = false;
+let playing = false, playStartedAt = 0, dropAudio = false, bargeOn = true, resumeTimer = 0, agent = 'Agent';
+const queue = [];
+
+// Phones allow audio only if playback starts inside a tap handler: unlock it once.
+const SILENT_WAV = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=';
+function unlockAudio(){
+  if (player) return;
+  player = new Audio(); player.setAttribute('playsinline', '');
+  player.onended = playNext; player.onerror = playNext;
+  try { player.src = SILENT_WAV; player.play().catch(() => {}); } catch(e){}
+}
+
+function connect(){
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + BASE + withK('/ws'));
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { setState(inCall ? 'in call' : 'ready'); sendRate(); const v = $('voice').value; if (v) sendJSON({type:'voice', id:v}); };
+  ws.onclose = () => { setState('reconnecting…'); setTimeout(connect, 1500); };
+  ws.onerror = () => showErr('Connection error.');
+  ws.onmessage = ev => onServer(JSON.parse(ev.data));
+}
+const sendJSON = o => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
+
+function onServer(d){
+  if (d.type === 'partial') setState('hearing: ' + d.text, 'listen');
+  else if (d.type === 'said'){ if (d.text) addLine('you', d.text, d.unsure); else setState('didn\'t catch that', ''); $('t_stt').textContent = ms(d.stt_ms); }
+  else if (d.type === 'audio'){
+    if (dropAudio) return;
+    if (waitingGreeting) { /* greeting is playing */ }
+    else if (!firstHeard){ firstHeard = true; $('t_pause').textContent = ms(performance.now() - endSentAt); }
+    $('t_tts').textContent = ms(d.tts_ms);
+    addLine('bot', d.text);
+    enqueue('data:' + d.mime + ';base64,' + d.b64);
+  }
+  else if (d.type === 'tts_failed'){ addLine('bot', d.text); showErr('Speech synthesis failed: ' + (d.message || '').slice(0, 160)); resumeListening(); }
+  else if (d.type === 'done'){
+    const t = d.timings || {};
+    if (t.llm_first_ms != null) $('t_llm1').textContent = ms(t.llm_first_ms);
+    if (t.stt_ms != null) $('t_stt').textContent = ms(t.stt_ms);
+    busy = false; updateBtn(); resumeListening();
+  }
+  else if (d.type === 'turn_end') endTurn();
+  else if (d.type === 'listen'){ waitingGreeting = false; resumeListening(); }
+  else if (d.type === 'error'){ showErr(d.message); busy = false; updateBtn(); resumeListening(); }
+}
+
+function enqueue(src){ queue.push(src); if (!playing) playNext(); }
+function playNext(){
+  if (!queue.length){
+    playing = false; updateBtn();
+    if (waitingGreeting) return;
+    if (!busy && inCall) resumeListening();
+    return;
+  }
+  playing = true; playStartedAt = performance.now(); bargeFrames = 0;
+  setState(agent + ' is speaking…', 'talk');
+  unlockAudio();
+  player.src = queue.shift();
+  player.play().catch(() => { playing = false; setState('tap the button: the browser blocks audio', ''); });
+}
+
+async function startCall(){
+  showErr('');
+  if (!ws || ws.readyState !== 1){ showErr('No connection to the server yet.'); return; }
+  if (!await openMic()) return;
+  inCall = true; waitingGreeting = true; sending = false;
+  sendJSON({type:'call'});
+  setState('calling…', 'talk'); updateBtn();
+}
+function endCall(){
+  clearTimeout(resumeTimer);
+  inCall = false; waitingGreeting = false; busy = false; sending = false;
+  queue.length = 0; playing = false;
+  try { player && player.pause(); } catch(e){}
+  closeMic(); updateBtn(); setState('call ended', '');
+}
+
+async function openMic(){
+  if (micLive) return true;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({audio:{channelCount:1, echoCancellation:true, noiseSuppression:true, autoGainControl:true}});
+  } catch(e){
+    showErr('Microphone unavailable: ' + e.name + '\nBrowsers allow the microphone only on https:// or http://localhost.');
+    return false;
+  }
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  await ctx.resume();
+  const src = ctx.createMediaStreamSource(stream);
+  node = ctx.createScriptProcessor(4096, 1, 1);
+  node.onaudioprocess = onAudio;
+  src.connect(node); node.connect(ctx.destination);
+  micLive = true; resetTurn(); sendRate();
+  return true;
+}
+function closeMic(){
+  micLive = false;
+  try { node && node.disconnect(); } catch(e){}
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (ctx) ctx.close().catch(() => {});
+  stream = node = ctx = null; $('lvl').style.width = '0';
+}
+// The raw microphone rate goes to the server, which resamples with a proper filter.
+function sendRate(){ if (ctx) sendJSON({type:'rate', hz: Math.round(ctx.sampleRate)}); }
+
+function resetTurn(){ spokeAt = speechMs = silenceSince = bargeFrames = 0; }
+function canListen(){ return inCall && micLive && !sending && !busy && !playing && !queue.length && !waitingGreeting; }
+function resumeListening(delay){
+  clearTimeout(resumeTimer);
+  resumeTimer = setTimeout(() => {
+    if (!canListen()) return;
+    resetTurn(); sending = true; setState('listening', 'listen'); updateBtn();
+  }, delay == null ? ECHO_TAIL_MS : delay);
+}
+
+function onAudio(e){
+  if (!micLive) return;
+  const buf = e.inputBuffer.getChannelData(0);
+  let sum = 0; for (let i = 0; i < buf.length; i++) sum += buf[i]*buf[i];
+  const rms = Math.sqrt(sum / buf.length), frameMs = buf.length / ctx.sampleRate * 1000;
+  if (!sending){
+    $('lvl').style.width = '0';
+    if (bargeOn && playing && performance.now() - playStartedAt > BARGE_GUARD_MS){
+      bargeFrames = rms > BARGE_LEVEL ? bargeFrames + 1 : 0;
+      if (bargeFrames >= BARGE_FRAMES) bargeIn();
+    }
+    return;
+  }
+  $('lvl').style.width = Math.min(100, rms * 900) + '%';
+  const now = performance.now();
+  if (rms > SILENCE_LEVEL){ speechMs += frameMs; silenceSince = 0; if (!spokeAt){ spokeAt = now; setState('hearing you', 'listen'); } }
+  else if (spokeAt){
+    if (!silenceSince) silenceSince = now;
+    const sil = now - silenceSince;
+    if (speechMs >= MIN_SPEECH_MS && sil > SILENCE_MS){ endTurn(); return; }
+    if (speechMs < MIN_SPEECH_MS && sil > 1200){ resetTurn(); setState('listening', 'listen'); }   // cough, click
+  }
+  const pcm = new Int16Array(buf.length);
+  for (let i = 0; i < buf.length; i++){ const s = buf[i]; pcm[i] = s < -1 ? -32768 : s > 1 ? 32767 : Math.round(s * 32767); }
+  if (ws.readyState === 1) ws.send(pcm.buffer);
+}
+
+function bargeIn(){
+  bargeFrames = 0; waitingGreeting = false;
+  queue.length = 0; playing = false;
+  try { player && player.pause(); } catch(e){}
+  dropAudio = true; busy = false;
+  sendJSON({type:'barge'}); addNote('you interrupted the agent'); resumeListening(0);
+}
+function endTurn(){
+  if (!sending) return;
+  sending = false; dropAudio = false; busy = true; firstHeard = false; endSentAt = performance.now();
+  resetTurn(); $('lvl').style.width = '0'; setState('thinking…', 'think'); updateBtn();
+  sendJSON({type:'end'});
+}
+
+function updateBtn(){
+  $('talk').textContent = inCall ? 'Hang up' : 'Call';
+  $('talk').classList.toggle('live', inCall);
+}
+function addNote(t){ const d = document.createElement('div'); d.className = 'note'; d.textContent = t; $('log').appendChild(d); }
+function addLine(who, text, unsure){
+  const log = $('log'), stub = log.querySelector('.empty'); if (stub) stub.remove();
+  const d = document.createElement('div'); d.className = 'msg ' + who;
+  const w = document.createElement('small'); w.textContent = who === 'you' ? 'You' + (unsure ? ' (low recognition confidence)' : '') : agent;
+  const b = document.createElement('div'); b.textContent = text;
+  d.append(w, b); log.appendChild(d); log.scrollTop = log.scrollHeight;
+}
+
+$('talk').onclick = () => { unlockAudio(); inCall ? endCall() : startCall(); };
+$('barge').onchange = e => { bargeOn = e.target.checked; };
+$('sil').oninput = e => { SILENCE_MS = +e.target.value; $('silv').textContent = (SILENCE_MS/1000).toFixed(2) + ' s'; };
+$('voice').onchange = e => sendJSON({type:'voice', id:e.target.value});
+
+(async function loadVoices(){
+  try {
+    const r = await fetch(withK(BASE + '/api/voices'), {cache:'no-store'});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json(); agent = d.agent || agent;
+    if ((d.voices || []).length > 1){
+      d.voices.forEach(v => { const o = document.createElement('option'); o.value = v.id; o.textContent = v.name + (v.note ? ' · ' + v.note : ''); $('voice').appendChild(o); });
+      $('voice').value = d.current; $('voice').hidden = false;
+    }
+  } catch(e){ showErr('Could not load the voice list: ' + e.message); }
+})();
+updateBtn(); connect();
+</script>
+</body>
+</html>

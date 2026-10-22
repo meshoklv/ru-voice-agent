@@ -1,0 +1,14 @@
+.env
+data/
+models/
+refs/
+voices.json
+*.wav
+*.mp3
+*.ogg
+*.onnx
+*.bin
+__pycache__/
+.venv*/
+.pytest_cache/
+.ruff_cache/

@@ -1,0 +1,12 @@
+aiohttp>=3.9,<4
+numpy>=1.26
+onnxruntime>=1.17,<2
+huggingface-hub>=0.20,<1.0
+pyctcdecode>=0.5,<1.0
+num2words>=0.5.13
+# T-one (the speech recognizer) is installed from git without its kenlm dependency,
+# see Dockerfile / `make install`:
+#   pip install --no-deps "tone @ git+https://github.com/voicekit-team/T-one.git@3c5b6c015038173840e62cea99e10cdb1c759116"
+# Text-to-speech engines (install the one you use):
+#   pip install piper-tts        # piper (default)
+#   pip install kokoro-onnx soundfile   # kokoro
